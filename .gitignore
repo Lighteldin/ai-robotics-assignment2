@@ -1,0 +1,15 @@
+# ROS
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+
+# Linux
+*.swp
