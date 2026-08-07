@@ -5,11 +5,19 @@ log/
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
 
 # IDEs
 .vscode/
 .idea/
 
-# Linux
+# Linux / Editors
 *.swp
+*~
+.DS_Store
