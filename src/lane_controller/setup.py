@@ -25,6 +25,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'lane_controller = lane_controller.lane_controller:main',
         ],
     },
 )
