@@ -9,6 +9,7 @@ import numpy as np
 
 from std_msgs.msg import Float32
 
+
 class LaneDetector(Node):
 
     def __init__(self):
@@ -28,6 +29,10 @@ class LaneDetector(Node):
             "/lane/error",
             10
         )
+
+        # Approximate distance between the two lane lines
+        # in the ROI, measured in pixels.
+        self.LANE_WIDTH = 300
 
         self.get_logger().info("Lane detector started!")
 
@@ -52,7 +57,7 @@ class LaneDetector(Node):
         # Threshold
         _, mask = cv2.threshold(
             saturation,
-            120,
+            80,
             255,
             cv2.THRESH_BINARY
         )
@@ -86,9 +91,14 @@ class LaneDetector(Node):
 
         roi_width = roi.shape[1]
 
+        # --------------------------------------------------
+        # Detect lane-line contours
+        # --------------------------------------------------
+
         for contour in contours:
 
             area = cv2.contourArea(contour)
+
             if area < 20:
                 continue
 
@@ -113,13 +123,17 @@ class LaneDetector(Node):
                 -1
             )
 
+            # Separate left and right lane boundaries
             if cx < roi_width // 2:
                 left_points.append((cx, cy))
             else:
                 right_points.append((cx, cy))
 
+        # --------------------------------------------------
+        # Calculate left lane center
+        # --------------------------------------------------
+
         left_center = None
-        right_center = None
 
         if left_points:
 
@@ -136,6 +150,12 @@ class LaneDetector(Node):
                 -1
             )
 
+        # --------------------------------------------------
+        # Calculate right lane center
+        # --------------------------------------------------
+
+        right_center = None
+
         if right_points:
 
             right_center = (
@@ -151,7 +171,10 @@ class LaneDetector(Node):
                 -1
             )
 
-        # Draw image center
+        # --------------------------------------------------
+        # Image center
+        # --------------------------------------------------
+
         image_center_x = roi_width // 2
 
         cv2.line(
@@ -162,13 +185,109 @@ class LaneDetector(Node):
             2
         )
 
-        # Draw lane center
+        # --------------------------------------------------
+        # Calculate lane center
+        # --------------------------------------------------
+
+        lane_center = None
+        detection_mode = "No lane"
+
+        # CASE 1:
+        # Both lane lines detected
         if left_center is not None and right_center is not None:
 
-            lane_center_x = int((left_center[0] + right_center[0]) / 2)
-            lane_center_y = int((left_center[1] + right_center[1]) / 2)
+            lane_center_x = int(
+                (left_center[0] + right_center[0]) / 2
+            )
 
-            lane_center = (lane_center_x, lane_center_y)
+            lane_center_y = int(
+                (left_center[1] + right_center[1]) / 2
+            )
+
+            lane_center = (
+                lane_center_x,
+                lane_center_y
+            )
+
+            detection_mode = "Both lanes"
+
+        # CASE 2:
+        # Only left lane detected
+        elif left_center is not None:
+
+            estimated_right_x = (
+                left_center[0] + self.LANE_WIDTH
+            )
+
+            lane_center_x = int(
+                (left_center[0] + estimated_right_x) / 2
+            )
+
+            lane_center_y = left_center[1]
+
+            lane_center = (
+                lane_center_x,
+                lane_center_y
+            )
+
+            detection_mode = "Left lane only"
+
+            # Draw estimated right lane
+            cv2.line(
+                result,
+                (
+                    estimated_right_x,
+                    0
+                ),
+                (
+                    estimated_right_x,
+                    roi.shape[0]
+                ),
+                (0, 165, 255),
+                2
+            )
+
+        # CASE 3:
+        # Only right lane detected
+        elif right_center is not None:
+
+            estimated_left_x = (
+                right_center[0] - self.LANE_WIDTH
+            )
+
+            lane_center_x = int(
+                (estimated_left_x + right_center[0]) / 2
+            )
+
+            lane_center_y = right_center[1]
+
+            lane_center = (
+                lane_center_x,
+                lane_center_y
+            )
+
+            detection_mode = "Right lane only"
+
+            # Draw estimated left lane
+            cv2.line(
+                result,
+                (
+                    estimated_left_x,
+                    0
+                ),
+                (
+                    estimated_left_x,
+                    roi.shape[0]
+                ),
+                (0, 165, 255),
+                2
+            )
+
+        # --------------------------------------------------
+        # Calculate and publish error
+        # --------------------------------------------------
+
+        if lane_center is not None:
 
             cv2.circle(
                 result,
@@ -178,20 +297,29 @@ class LaneDetector(Node):
                 -1
             )
 
+            # Draw error from image center to lane center
             cv2.line(
                 result,
                 lane_center,
-                (image_center_x, lane_center_y),
+                (
+                    image_center_x,
+                    lane_center[1]
+                ),
                 (0, 255, 255),
                 2
             )
 
-            error = float(lane_center_x - image_center_x)
+            error = float(
+                lane_center[0] - image_center_x
+            )
 
+            # Publish error
             error_msg = Float32()
             error_msg.data = error
+
             self.error_pub.publish(error_msg)
 
+            # Display error
             cv2.putText(
                 result,
                 f"Error: {error:.1f}",
@@ -202,6 +330,32 @@ class LaneDetector(Node):
                 2
             )
 
+            cv2.putText(
+                result,
+                detection_mode,
+                (20, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2
+            )
+
+        else:
+
+            # No lane detected
+            cv2.putText(
+                result,
+                "No lane detected",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 0, 255),
+                2
+            )
+
+        # --------------------------------------------------
+        # Display
+        # --------------------------------------------------
 
         cv2.imshow("Original", frame)
         cv2.imshow("ROI", roi)
@@ -220,6 +374,7 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
 
