@@ -10,96 +10,166 @@ class LaneController(Node):
     def __init__(self):
         super().__init__("lane_controller")
 
-        self.error = 0.0
-        self.previous_error = 0.0
-        self.integral_error = 0.0
+        # -------------------------
+        # Controller parameters
+        # -------------------------
 
+        # PD gains
+        self.kp = 0.02
+        self.kd = 0.0005
+
+        self.forward_speed = 5.0
+        self.steering_limit = 0.8
+
+        # -------------------------
+        # Controller state
+        # -------------------------
+
+        self.previous_error = 0.0
         self.last_time = self.get_clock().now()
 
-        self.subscription = self.create_subscription(
+        # -------------------------
+        # ROS communication
+        # -------------------------
+
+        self.error_subscription = self.create_subscription(
             Float32,
             "/lane/error",
             self.error_callback,
             10
         )
 
-        self.cmd_pub = self.create_publisher(
+        self.cmd_publisher = self.create_publisher(
             Twist,
             "/cmd_vel",
             10
         )
 
-        # PID gains
-        self.kp = 0.01
-        self.ki = 0.00002
-        self.kd = 0.0005
+        self.get_logger().info(
+            "Lane controller started!"
+        )
 
-        # Prevent integral windup
-        self.integral_limit = 1000.0
-
-        # Limit steering
-        self.steering_limit = 0.5
-
-        self.get_logger().info("Lane controller started!")
+    # =========================================================
+    # Main callback
+    # =========================================================
 
     def error_callback(self, msg):
 
-        self.error = msg.data
+        error = msg.data
 
-        # Calculate time difference
+        dt = self.calculate_dt()
+
+        derivative = self.calculate_derivative(
+            error,
+            dt
+        )
+
+        steering = self.calculate_steering(
+            error,
+            derivative
+        )
+
+        self.publish_velocity(steering)
+
+        self.update_controller_state(error)
+
+        self.log_controller_state(
+            error,
+            derivative,
+            steering
+        )
+
+    # =========================================================
+    # Time calculation
+    # =========================================================
+
+    def calculate_dt(self):
+
         current_time = self.get_clock().now()
-        dt = (current_time - self.last_time).nanoseconds / 1e9
 
-        # Protect against invalid/small dt
+        dt = (
+            current_time - self.last_time
+        ).nanoseconds / 1e9
+
         if dt <= 0.0:
             dt = 0.001
 
-        # Integral term
-        self.integral_error += self.error * dt
+        return dt
 
-        # Prevent integral windup
-        self.integral_error = max(
-            -self.integral_limit,
-            min(self.integral_limit, self.integral_error)
-        )
+    # =========================================================
+    # Derivative calculation
+    # =========================================================
 
-        # Derivative term
-        derivative_error = (
-            self.error - self.previous_error
+    def calculate_derivative(self, error, dt):
+
+        derivative = (
+            error - self.previous_error
         ) / dt
 
-        # PID controller
+        return derivative
+
+    # =========================================================
+    # Steering calculation
+    # =========================================================
+
+    def calculate_steering(
+        self,
+        error,
+        derivative
+    ):
+
         steering = -(
-            self.kp * self.error
-            + self.ki * self.integral_error
-            + self.kd * derivative_error
+            self.kp * error
+            + self.kd * derivative
         )
 
         # Limit steering
         steering = max(
             -self.steering_limit,
-            min(self.steering_limit, steering)
+            min(
+                self.steering_limit,
+                steering
+            )
         )
 
-        # Update previous values
-        self.previous_error = self.error
-        self.last_time = current_time
+        return steering
 
-        # Create velocity command
+    # =========================================================
+    # Vehicle control
+    # =========================================================
+
+    def publish_velocity(self, steering):
+
         cmd = Twist()
 
-        # Forward speed
-        cmd.linear.x = 2.0
-
-        # Steering
+        cmd.linear.x = self.forward_speed
         cmd.angular.z = steering
 
-        self.cmd_pub.publish(cmd)
+        self.cmd_publisher.publish(cmd)
+
+    # =========================================================
+    # State management
+    # =========================================================
+
+    def update_controller_state(self, error):
+
+        self.previous_error = error
+        self.last_time = self.get_clock().now()
+
+    # =========================================================
+    # Logging
+    # =========================================================
+
+    def log_controller_state(
+        self,
+        error,
+        derivative,
+        steering
+    ):
 
         self.get_logger().info(
-            f"Error: {self.error:.2f} | "
-            f"Integral: {self.integral_error:.2f} | "
-            f"Derivative: {derivative_error:.2f} | "
+            f"Error: {error:.2f} | "
+            f"Derivative: {derivative:.2f} | "
             f"Steering: {steering:.3f}"
         )
 
@@ -112,11 +182,13 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
 
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
