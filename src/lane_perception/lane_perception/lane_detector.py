@@ -2,12 +2,12 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float32
+
 from cv_bridge import CvBridge
 
 import cv2
 import numpy as np
-
-from std_msgs.msg import Float32
 
 
 class LaneDetector(Node):
@@ -15,26 +15,51 @@ class LaneDetector(Node):
     def __init__(self):
         super().__init__("lane_detector")
 
+        # =====================================================
+        # Parameters
+        # =====================================================
+
+        self.lane_width = 600
+
+        # HLS saturation threshold
+        self.saturation_threshold = 80
+
+        # Hough parameters
+        self.hough_threshold = 20
+        self.min_line_length = 25
+        self.max_line_gap = 40
+
+        # Minimum line angle.
+        # We deliberately keep this LOW because the right lane
+        # can appear relatively flat due to perspective.
+        self.min_angle = 5.0
+
+        # =====================================================
+        # ROS
+        # =====================================================
+
         self.bridge = CvBridge()
 
-        self.subscription = self.create_subscription(
+        self.image_subscription = self.create_subscription(
             Image,
             "/prius/front_camera/image_raw",
             self.image_callback,
             10
         )
 
-        self.error_pub = self.create_publisher(
+        self.error_publisher = self.create_publisher(
             Float32,
             "/lane/error",
             10
         )
 
-        # Approximate distance between the two lane lines
-        # in the ROI, measured in pixels.
-        self.LANE_WIDTH = 300
+        self.get_logger().info(
+            "Lane detector started!"
+        )
 
-        self.get_logger().info("Lane detector started!")
+    # =========================================================
+    # IMAGE CALLBACK
+    # =========================================================
 
     def image_callback(self, msg):
 
@@ -43,27 +68,113 @@ class LaneDetector(Node):
             desired_encoding="bgr8"
         )
 
+        roi = self.get_roi(frame)
+
+        saturation = self.get_hls_saturation(roi)
+
+        mask = self.create_mask(saturation)
+
+        lines = self.detect_lines(mask)
+
+        left_line, right_line = self.classify_lines(
+            lines,
+            roi.shape[1]
+        )
+
+        left_center = self.get_line_center(
+            left_line
+        )
+
+        right_center = self.get_line_center(
+            right_line
+        )
+
+        lane_center, detection_mode = self.calculate_lane_center(
+            left_center,
+            right_center,
+            roi.shape[1]
+        )
+
+        error = self.calculate_error(
+            lane_center,
+            roi.shape[1]
+        )
+
+        result = self.draw_detection(
+            roi,
+            lines,
+            left_line,
+            right_line,
+            lane_center,
+            detection_mode,
+            error
+        )
+
+        self.publish_error(error)
+
+        cv2.imshow(
+            "HLS Saturation",
+            saturation
+        )
+
+        cv2.imshow(
+            "Lane Detection",
+            result
+        )
+
+        cv2.waitKey(1)
+
+    # =========================================================
+    # ROI
+    # =========================================================
+
+    def get_roi(self, frame):
+
         height, width = frame.shape[:2]
 
-        # Crop road only
-        roi = frame[int(height * 0.45):int(height * 0.78), :]
+        # Keep the road area.
+        #
+        # We deliberately do not crop too aggressively because
+        # the lane lines can appear relatively high in the image
+        # when the car approaches a curve.
+        top = int(height * 0.45)
+        bottom = int(height * 0.85)
 
-        # HSV
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        return frame[top:bottom, :]
 
-        # Saturation channel
-        saturation = hsv[:, :, 1]
+    # =========================================================
+    # HLS SATURATION
+    # =========================================================
 
-        # Threshold
+    def get_hls_saturation(self, roi):
+
+        hls = cv2.cvtColor(
+            roi,
+            cv2.COLOR_BGR2HLS
+        )
+
+        saturation = hls[:, :, 2]
+
+        return saturation
+
+    # =========================================================
+    # CREATE MASK
+    # =========================================================
+
+    def create_mask(self, saturation):
+
         _, mask = cv2.threshold(
             saturation,
-            80,
+            self.saturation_threshold,
             255,
             cv2.THRESH_BINARY
         )
 
-        # Morphology
-        kernel = np.ones((5, 5), np.uint8)
+        # Remove tiny isolated noise.
+        kernel = np.ones(
+            (3, 3),
+            np.uint8
+        )
 
         mask = cv2.morphologyEx(
             mask,
@@ -71,221 +182,512 @@ class LaneDetector(Node):
             kernel
         )
 
+        # Connect small gaps in the lane markings.
         mask = cv2.morphologyEx(
             mask,
             cv2.MORPH_CLOSE,
             kernel
         )
 
-        # Find contours
-        contours, _ = cv2.findContours(
+        return mask
+
+    # =========================================================
+    # HOUGH LINE DETECTION
+    # =========================================================
+
+    def detect_lines(self, mask):
+
+        lines = cv2.HoughLinesP(
             mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
+            rho=1,
+            theta=np.pi / 180,
+            threshold=self.hough_threshold,
+            minLineLength=self.min_line_length,
+            maxLineGap=self.max_line_gap
         )
 
-        result = roi.copy()
+        return lines
 
-        left_points = []
-        right_points = []
+    # =========================================================
+    # LINE CLASSIFICATION
+    # =========================================================
 
-        roi_width = roi.shape[1]
+    def classify_lines(
+        self,
+        lines,
+        roi_width
+    ):
 
-        # --------------------------------------------------
-        # Detect lane-line contours
-        # --------------------------------------------------
+        left_candidates = []
+        right_candidates = []
 
-        for contour in contours:
+        if lines is None:
+            return None, None
 
-            area = cv2.contourArea(contour)
+        image_center = roi_width / 2
 
-            if area < 20:
+        for line_data in lines:
+
+            x1, y1, x2, y2 = line_data[0]
+
+            dx = x2 - x1
+            dy = y2 - y1
+
+            # Avoid vertical division problems.
+            if abs(dx) < 1:
                 continue
 
-            x, y, w, h = cv2.boundingRect(contour)
-
-            cv2.rectangle(
-                result,
-                (x, y),
-                (x + w, y + h),
-                (255, 0, 0),
-                2
+            length = np.sqrt(
+                dx ** 2 + dy ** 2
             )
 
-            cx = x + w // 2
-            cy = y + h // 2
+            if length < self.min_line_length:
+                continue
 
-            cv2.circle(
-                result,
-                (cx, cy),
-                5,
-                (0, 0, 255),
-                -1
+            slope = dy / dx
+
+            angle = np.degrees(
+                np.arctan2(
+                    dy,
+                    dx
+                )
             )
 
-            # Separate left and right lane boundaries
-            if cx < roi_width // 2:
-                left_points.append((cx, cy))
-            else:
-                right_points.append((cx, cy))
+            # Normalize angle to -90 ... 90
+            if angle > 90:
+                angle -= 180
 
-        # --------------------------------------------------
-        # Calculate left lane center
-        # --------------------------------------------------
+            if angle < -90:
+                angle += 180
 
-        left_center = None
+            if abs(angle) < self.min_angle:
+                continue
 
-        if left_points:
+            # -------------------------------------------------
+            # Midpoint of line
+            # -------------------------------------------------
 
-            left_center = (
-                int(np.mean([p[0] for p in left_points])),
-                int(np.mean([p[1] for p in left_points]))
-            )
+            midpoint_x = (
+                x1 + x2
+            ) / 2
 
-            cv2.circle(
-                result,
-                left_center,
-                10,
-                (255, 0, 255),
-                -1
-            )
+            midpoint_y = (
+                y1 + y2
+            ) / 2
 
-        # --------------------------------------------------
-        # Calculate right lane center
-        # --------------------------------------------------
+            # -------------------------------------------------
+            # LEFT LINE
+            #
+            # In image coordinates the left lane generally
+            # has a negative slope.
+            #
+            # We ALSO require its midpoint to be left of the
+            # image center.
+            # -------------------------------------------------
 
-        right_center = None
+            if slope < -0.15:
 
-        if right_points:
+                if midpoint_x < image_center:
 
-            right_center = (
-                int(np.mean([p[0] for p in right_points])),
-                int(np.mean([p[1] for p in right_points]))
-            )
+                    left_candidates.append(
+                        (
+                            line_data[0],
+                            length,
+                            midpoint_x,
+                            midpoint_y
+                        )
+                    )
 
-            cv2.circle(
-                result,
-                right_center,
-                10,
-                (255, 0, 255),
-                -1
-            )
+            # -------------------------------------------------
+            # RIGHT LINE
+            #
+            # The right lane generally has a positive slope.
+            #
+            # IMPORTANT:
+            # We intentionally use +0.05 rather than +0.25.
+            #
+            # The Prius camera perspective can make the right
+            # lane appear almost horizontal.
+            # -------------------------------------------------
 
-        # --------------------------------------------------
-        # Image center
-        # --------------------------------------------------
+            elif slope > 0.05:
 
-        image_center_x = roi_width // 2
+                if midpoint_x > image_center:
 
-        cv2.line(
-            result,
-            (image_center_x, 0),
-            (image_center_x, roi.shape[0]),
-            (255, 255, 255),
-            2
+                    right_candidates.append(
+                        (
+                            line_data[0],
+                            length,
+                            midpoint_x,
+                            midpoint_y
+                        )
+                    )
+
+        left_line = self.select_best_line(
+            left_candidates,
+            prefer_left=True,
+            image_center=image_center
         )
 
-        # --------------------------------------------------
-        # Calculate lane center
-        # --------------------------------------------------
+        right_line = self.select_best_line(
+            right_candidates,
+            prefer_left=False,
+            image_center=image_center
+        )
 
-        lane_center = None
-        detection_mode = "No lane"
+        return left_line, right_line
 
-        # CASE 1:
-        # Both lane lines detected
-        if left_center is not None and right_center is not None:
+    # =========================================================
+    # SELECT BEST LINE
+    # =========================================================
+
+    def select_best_line(
+        self,
+        candidates,
+        prefer_left,
+        image_center
+    ):
+
+        if not candidates:
+            return None
+
+        # Score candidates.
+        #
+        # We want:
+        # - long lines
+        # - lines clearly on their respective side
+        #
+        # This prevents random small yellow objects from winning.
+
+        best_line = None
+        best_score = -float("inf")
+
+        for line, length, midpoint_x, midpoint_y in candidates:
+
+            distance_from_center = abs(
+                midpoint_x - image_center
+            )
+
+            length_score = length
+
+            position_score = distance_from_center
+
+            score = (
+                length_score
+                + position_score * 0.5
+            )
+
+            if score > best_score:
+
+                best_score = score
+                best_line = line
+
+        return best_line
+
+    # =========================================================
+    # LINE CENTER
+    # =========================================================
+
+    def get_line_center(self, line):
+
+        if line is None:
+            return None
+
+        x1, y1, x2, y2 = line
+
+        center_x = int(
+            (x1 + x2) / 2
+        )
+
+        center_y = int(
+            (y1 + y2) / 2
+        )
+
+        return (
+            center_x,
+            center_y
+        )
+
+    # =========================================================
+    # LANE CENTER
+    # =========================================================
+
+    def calculate_lane_center(
+        self,
+        left_center,
+        right_center,
+        roi_width
+    ):
+
+        image_center = roi_width // 2
+
+        # -----------------------------------------------------
+        # BOTH LANES
+        # -----------------------------------------------------
+
+        if (
+            left_center is not None
+            and right_center is not None
+        ):
 
             lane_center_x = int(
-                (left_center[0] + right_center[0]) / 2
+                (
+                    left_center[0]
+                    + right_center[0]
+                ) / 2
             )
 
             lane_center_y = int(
-                (left_center[1] + right_center[1]) / 2
+                (
+                    left_center[1]
+                    + right_center[1]
+                ) / 2
             )
 
-            lane_center = (
+            return (
                 lane_center_x,
                 lane_center_y
-            )
+            ), "Both lanes"
 
-            detection_mode = "Both lanes"
+        # -----------------------------------------------------
+        # LEFT ONLY
+        # -----------------------------------------------------
 
-        # CASE 2:
-        # Only left lane detected
-        elif left_center is not None:
+        if left_center is not None:
 
             estimated_right_x = (
-                left_center[0] + self.LANE_WIDTH
+                left_center[0]
+                + self.lane_width
             )
 
             lane_center_x = int(
-                (left_center[0] + estimated_right_x) / 2
+                (
+                    left_center[0]
+                    + estimated_right_x
+                ) / 2
             )
 
             lane_center_y = left_center[1]
 
-            lane_center = (
+            return (
                 lane_center_x,
                 lane_center_y
-            )
+            ), "Left lane only"
 
-            detection_mode = "Left lane only"
+        # -----------------------------------------------------
+        # RIGHT ONLY
+        # -----------------------------------------------------
 
-            # Draw estimated right lane
-            cv2.line(
-                result,
-                (
-                    estimated_right_x,
-                    0
-                ),
-                (
-                    estimated_right_x,
-                    roi.shape[0]
-                ),
-                (0, 165, 255),
-                2
-            )
-
-        # CASE 3:
-        # Only right lane detected
-        elif right_center is not None:
+        if right_center is not None:
 
             estimated_left_x = (
-                right_center[0] - self.LANE_WIDTH
+                right_center[0]
+                - self.lane_width
             )
 
             lane_center_x = int(
-                (estimated_left_x + right_center[0]) / 2
+                (
+                    estimated_left_x
+                    + right_center[0]
+                ) / 2
             )
 
             lane_center_y = right_center[1]
 
-            lane_center = (
+            return (
                 lane_center_x,
                 lane_center_y
+            ), "Right lane only"
+
+        # -----------------------------------------------------
+        # NOTHING
+        # -----------------------------------------------------
+
+        return None, "No lane"
+
+    # =========================================================
+    # ERROR
+    # =========================================================
+
+    def calculate_error(
+        self,
+        lane_center,
+        roi_width
+    ):
+
+        if lane_center is None:
+            return None
+
+        image_center = roi_width // 2
+
+        return float(
+            lane_center[0]
+            - image_center
+        )
+
+    # =========================================================
+    # PUBLISH ERROR
+    # =========================================================
+
+    def publish_error(self, error):
+
+        if error is None:
+            return
+
+        msg = Float32()
+
+        msg.data = error
+
+        self.error_publisher.publish(
+            msg
+        )
+
+    # =========================================================
+    # DRAW DETECTION
+    # =========================================================
+
+    def draw_detection(
+        self,
+        roi,
+        lines,
+        left_line,
+        right_line,
+        lane_center,
+        detection_mode,
+        error
+    ):
+
+        result = roi.copy()
+
+        roi_height, roi_width = result.shape[:2]
+
+        image_center = roi_width // 2
+
+        # -----------------------------------------------------
+        # Draw ALL Hough candidates faintly
+        # -----------------------------------------------------
+
+        if lines is not None:
+
+            for line_data in lines:
+
+                x1, y1, x2, y2 = line_data[0]
+
+                cv2.line(
+                    result,
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
+                    (100, 100, 100),
+                    1
+                )
+
+        # -----------------------------------------------------
+        # Draw selected LEFT line
+        # -----------------------------------------------------
+
+        if left_line is not None:
+
+            x1, y1, x2, y2 = left_line
+
+            cv2.line(
+                result,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (255, 0, 255),
+                4
             )
 
-            detection_mode = "Right lane only"
+        # -----------------------------------------------------
+        # Draw selected RIGHT line
+        # -----------------------------------------------------
 
-            # Draw estimated left lane
+        if right_line is not None:
+
+            x1, y1, x2, y2 = right_line
+
+            cv2.line(
+                result,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (255, 0, 255),
+                4
+            )
+
+        # -----------------------------------------------------
+        # Draw estimated missing lane
+        # -----------------------------------------------------
+
+        if detection_mode == "Left lane only":
+
+            left_x = left_line[0]
+
+            left_y = left_line[1]
+
+            right_x = (
+                int(left_x)
+                + self.lane_width
+            )
+
             cv2.line(
                 result,
                 (
-                    estimated_left_x,
-                    0
+                    right_x,
+                    int(left_y)
                 ),
                 (
-                    estimated_left_x,
-                    roi.shape[0]
+                    right_x,
+                    roi_height
                 ),
                 (0, 165, 255),
                 2
             )
 
-        # --------------------------------------------------
-        # Calculate and publish error
-        # --------------------------------------------------
+        elif detection_mode == "Right lane only":
+
+            right_x = right_line[0]
+
+            right_y = right_line[1]
+
+            left_x = (
+                int(right_x)
+                - self.lane_width
+            )
+
+            cv2.line(
+                result,
+                (
+                    left_x,
+                    int(right_y)
+                ),
+                (
+                    left_x,
+                    roi_height
+                ),
+                (0, 165, 255),
+                2
+            )
+
+        # -----------------------------------------------------
+        # Image center
+        # -----------------------------------------------------
+
+        cv2.line(
+            result,
+            (
+                image_center,
+                0
+            ),
+            (
+                image_center,
+                roi_height
+            ),
+            (255, 255, 255),
+            2
+        )
+
+        # -----------------------------------------------------
+        # Lane center
+        # -----------------------------------------------------
 
         if lane_center is not None:
 
@@ -297,29 +699,17 @@ class LaneDetector(Node):
                 -1
             )
 
-            # Draw error from image center to lane center
             cv2.line(
                 result,
                 lane_center,
                 (
-                    image_center_x,
+                    image_center,
                     lane_center[1]
                 ),
                 (0, 255, 255),
                 2
             )
 
-            error = float(
-                lane_center[0] - image_center_x
-            )
-
-            # Publish error
-            error_msg = Float32()
-            error_msg.data = error
-
-            self.error_pub.publish(error_msg)
-
-            # Display error
             cv2.putText(
                 result,
                 f"Error: {error:.1f}",
@@ -330,19 +720,8 @@ class LaneDetector(Node):
                 2
             )
 
-            cv2.putText(
-                result,
-                detection_mode,
-                (20, 75),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2
-            )
-
         else:
 
-            # No lane detected
             cv2.putText(
                 result,
                 "No lane detected",
@@ -353,18 +732,26 @@ class LaneDetector(Node):
                 2
             )
 
-        # --------------------------------------------------
-        # Display
-        # --------------------------------------------------
+        # -----------------------------------------------------
+        # Detection mode
+        # -----------------------------------------------------
 
-        cv2.imshow("Original", frame)
-        cv2.imshow("ROI", roi)
-        cv2.imshow("Saturation", saturation)
-        cv2.imshow("Mask", mask)
-        cv2.imshow("Lane Detection", result)
+        cv2.putText(
+            result,
+            detection_mode,
+            (20, 75),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
 
-        cv2.waitKey(1)
+        return result
 
+
+# =============================================================
+# MAIN
+# =============================================================
 
 def main(args=None):
 
@@ -378,11 +765,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
 
-    node.destroy_node()
+    finally:
+        node.destroy_node()
 
-    cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
-    rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
