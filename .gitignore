@@ -21,3 +21,5 @@ env/
 *.swp
 *~
 .DS_Store
+
+cmd_vel_bag/
