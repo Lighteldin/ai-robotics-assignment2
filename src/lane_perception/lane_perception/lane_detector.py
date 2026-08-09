@@ -21,6 +21,10 @@ class LaneDetector(Node):
 
         self.lane_width = 600
 
+        # Error used when both lane lines are completely lost.
+        # Negative = steer left in the current controller setup.
+        self.lost_lane_error = -50.0
+
         # HLS saturation threshold
         self.saturation_threshold = 80
 
@@ -29,9 +33,7 @@ class LaneDetector(Node):
         self.min_line_length = 25
         self.max_line_gap = 40
 
-        # Minimum line angle.
-        # We deliberately keep this LOW because the right lane
-        # can appear relatively flat due to perspective.
+        # Minimum line angle
         self.min_angle = 5.0
 
         # =====================================================
@@ -95,10 +97,34 @@ class LaneDetector(Node):
             roi.shape[1]
         )
 
+        # =====================================================
+        # ERROR
+        # =====================================================
+
         error = self.calculate_error(
             lane_center,
             roi.shape[1]
         )
+
+        # =====================================================
+        # LOST LANE RECOVERY
+        # =====================================================
+
+        if error is None:
+
+            # Both lanes are lost.
+            #
+            # Ignore the previous error completely.
+            # Force the controller to steer LEFT until
+            # a lane is detected again.
+
+            error = self.lost_lane_error
+
+            detection_mode = "LANE LOST - TURNING LEFT"
+
+        # =====================================================
+        # DRAW
+        # =====================================================
 
         result = self.draw_detection(
             roi,
@@ -110,7 +136,15 @@ class LaneDetector(Node):
             error
         )
 
+        # =====================================================
+        # PUBLISH
+        # =====================================================
+
         self.publish_error(error)
+
+        # =====================================================
+        # DISPLAY
+        # =====================================================
 
         cv2.imshow(
             "HLS Saturation",
@@ -132,11 +166,6 @@ class LaneDetector(Node):
 
         height, width = frame.shape[:2]
 
-        # Keep the road area.
-        #
-        # We deliberately do not crop too aggressively because
-        # the lane lines can appear relatively high in the image
-        # when the car approaches a curve.
         top = int(height * 0.45)
         bottom = int(height * 0.85)
 
@@ -170,7 +199,7 @@ class LaneDetector(Node):
             cv2.THRESH_BINARY
         )
 
-        # Remove tiny isolated noise.
+        # Remove tiny isolated noise
         kernel = np.ones(
             (3, 3),
             np.uint8
@@ -182,7 +211,7 @@ class LaneDetector(Node):
             kernel
         )
 
-        # Connect small gaps in the lane markings.
+        # Connect small gaps
         mask = cv2.morphologyEx(
             mask,
             cv2.MORPH_CLOSE,
@@ -233,7 +262,7 @@ class LaneDetector(Node):
             dx = x2 - x1
             dy = y2 - y1
 
-            # Avoid vertical division problems.
+            # Avoid division problems
             if abs(dx) < 1:
                 continue
 
@@ -264,7 +293,7 @@ class LaneDetector(Node):
                 continue
 
             # -------------------------------------------------
-            # Midpoint of line
+            # Midpoint
             # -------------------------------------------------
 
             midpoint_x = (
@@ -277,12 +306,6 @@ class LaneDetector(Node):
 
             # -------------------------------------------------
             # LEFT LINE
-            #
-            # In image coordinates the left lane generally
-            # has a negative slope.
-            #
-            # We ALSO require its midpoint to be left of the
-            # image center.
             # -------------------------------------------------
 
             if slope < -0.15:
@@ -300,14 +323,6 @@ class LaneDetector(Node):
 
             # -------------------------------------------------
             # RIGHT LINE
-            #
-            # The right lane generally has a positive slope.
-            #
-            # IMPORTANT:
-            # We intentionally use +0.05 rather than +0.25.
-            #
-            # The Prius camera perspective can make the right
-            # lane appear almost horizontal.
             # -------------------------------------------------
 
             elif slope > 0.05:
@@ -322,6 +337,10 @@ class LaneDetector(Node):
                             midpoint_y
                         )
                     )
+
+        # -----------------------------------------------------
+        # Select best candidates
+        # -----------------------------------------------------
 
         left_line = self.select_best_line(
             left_candidates,
@@ -350,14 +369,6 @@ class LaneDetector(Node):
 
         if not candidates:
             return None
-
-        # Score candidates.
-        #
-        # We want:
-        # - long lines
-        # - lines clearly on their respective side
-        #
-        # This prevents random small yellow objects from winning.
 
         best_line = None
         best_score = -float("inf")
@@ -421,9 +432,9 @@ class LaneDetector(Node):
 
         image_center = roi_width // 2
 
-        # -----------------------------------------------------
+        # =====================================================
         # BOTH LANES
-        # -----------------------------------------------------
+        # =====================================================
 
         if (
             left_center is not None
@@ -449,9 +460,9 @@ class LaneDetector(Node):
                 lane_center_y
             ), "Both lanes"
 
-        # -----------------------------------------------------
+        # =====================================================
         # LEFT ONLY
-        # -----------------------------------------------------
+        # =====================================================
 
         if left_center is not None:
 
@@ -474,9 +485,9 @@ class LaneDetector(Node):
                 lane_center_y
             ), "Left lane only"
 
-        # -----------------------------------------------------
+        # =====================================================
         # RIGHT ONLY
-        # -----------------------------------------------------
+        # =====================================================
 
         if right_center is not None:
 
@@ -499,9 +510,9 @@ class LaneDetector(Node):
                 lane_center_y
             ), "Right lane only"
 
-        # -----------------------------------------------------
+        # =====================================================
         # NOTHING
-        # -----------------------------------------------------
+        # =====================================================
 
         return None, "No lane"
 
@@ -563,9 +574,9 @@ class LaneDetector(Node):
 
         image_center = roi_width // 2
 
-        # -----------------------------------------------------
-        # Draw ALL Hough candidates faintly
-        # -----------------------------------------------------
+        # =====================================================
+        # ALL HOUGH CANDIDATES
+        # =====================================================
 
         if lines is not None:
 
@@ -581,9 +592,9 @@ class LaneDetector(Node):
                     1
                 )
 
-        # -----------------------------------------------------
-        # Draw selected LEFT line
-        # -----------------------------------------------------
+        # =====================================================
+        # SELECTED LEFT LINE
+        # =====================================================
 
         if left_line is not None:
 
@@ -597,9 +608,9 @@ class LaneDetector(Node):
                 4
             )
 
-        # -----------------------------------------------------
-        # Draw selected RIGHT line
-        # -----------------------------------------------------
+        # =====================================================
+        # SELECTED RIGHT LINE
+        # =====================================================
 
         if right_line is not None:
 
@@ -613,14 +624,13 @@ class LaneDetector(Node):
                 4
             )
 
-        # -----------------------------------------------------
-        # Draw estimated missing lane
-        # -----------------------------------------------------
+        # =====================================================
+        # ESTIMATED MISSING LANE
+        # =====================================================
 
         if detection_mode == "Left lane only":
 
             left_x = left_line[0]
-
             left_y = left_line[1]
 
             right_x = (
@@ -645,7 +655,6 @@ class LaneDetector(Node):
         elif detection_mode == "Right lane only":
 
             right_x = right_line[0]
-
             right_y = right_line[1]
 
             left_x = (
@@ -667,9 +676,9 @@ class LaneDetector(Node):
                 2
             )
 
-        # -----------------------------------------------------
-        # Image center
-        # -----------------------------------------------------
+        # =====================================================
+        # IMAGE CENTER
+        # =====================================================
 
         cv2.line(
             result,
@@ -685,9 +694,9 @@ class LaneDetector(Node):
             2
         )
 
-        # -----------------------------------------------------
-        # Lane center
-        # -----------------------------------------------------
+        # =====================================================
+        # LANE CENTER
+        # =====================================================
 
         if lane_center is not None:
 
@@ -710,31 +719,23 @@ class LaneDetector(Node):
                 2
             )
 
-            cv2.putText(
-                result,
-                f"Error: {error:.1f}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 255),
-                2
-            )
+        # =====================================================
+        # ERROR
+        # =====================================================
 
-        else:
+        cv2.putText(
+            result,
+            f"Error: {error:.1f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 255),
+            2
+        )
 
-            cv2.putText(
-                result,
-                "No lane detected",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                2
-            )
-
-        # -----------------------------------------------------
-        # Detection mode
-        # -----------------------------------------------------
+        # =====================================================
+        # DETECTION MODE
+        # =====================================================
 
         cv2.putText(
             result,
@@ -766,6 +767,7 @@ def main(args=None):
         pass
 
     finally:
+
         node.destroy_node()
 
         cv2.destroyAllWindows()
