@@ -21,8 +21,8 @@ class LaneDetector(Node):
 
         self.lane_width = 600
 
-        # Error used when both lane lines are completely lost.
-        # Negative = steer left in the current controller setup.
+        # When both lanes disappear:
+        # negative = steer left
         self.lost_lane_error = -50.0
 
         # HLS saturation threshold
@@ -70,13 +70,36 @@ class LaneDetector(Node):
             desired_encoding="bgr8"
         )
 
+        # -----------------------------------------------------
+        # ROI
+        # -----------------------------------------------------
+
         roi = self.get_roi(frame)
+
+        # -----------------------------------------------------
+        # HLS
+        # -----------------------------------------------------
 
         saturation = self.get_hls_saturation(roi)
 
-        mask = self.create_mask(saturation)
+        # -----------------------------------------------------
+        # MASK
+        # -----------------------------------------------------
+
+        mask = self.create_mask(
+            saturation,
+            roi
+        )
+
+        # -----------------------------------------------------
+        # HOUGH
+        # -----------------------------------------------------
 
         lines = self.detect_lines(mask)
+
+        # -----------------------------------------------------
+        # CLASSIFY
+        # -----------------------------------------------------
 
         left_line, right_line = self.classify_lines(
             lines,
@@ -91,15 +114,19 @@ class LaneDetector(Node):
             right_line
         )
 
+        # -----------------------------------------------------
+        # LANE CENTER
+        # -----------------------------------------------------
+
         lane_center, detection_mode = self.calculate_lane_center(
             left_center,
             right_center,
             roi.shape[1]
         )
 
-        # =====================================================
+        # -----------------------------------------------------
         # ERROR
-        # =====================================================
+        # -----------------------------------------------------
 
         error = self.calculate_error(
             lane_center,
@@ -114,9 +141,9 @@ class LaneDetector(Node):
 
             # Both lanes are lost.
             #
-            # Ignore the previous error completely.
-            # Force the controller to steer LEFT until
-            # a lane is detected again.
+            # Ignore previous error.
+            # Force the car to steer LEFT until a lane
+            # becomes visible again.
 
             error = self.lost_lane_error
 
@@ -149,6 +176,11 @@ class LaneDetector(Node):
         cv2.imshow(
             "HLS Saturation",
             saturation
+        )
+
+        cv2.imshow(
+            "Lane Mask",
+            mask
         )
 
         cv2.imshow(
@@ -190,21 +222,68 @@ class LaneDetector(Node):
     # CREATE MASK
     # =========================================================
 
-    def create_mask(self, saturation):
+    def create_mask(
+        self,
+        saturation,
+        roi
+    ):
 
-        _, mask = cv2.threshold(
+        # =====================================================
+        # Convert ROI to HLS
+        # =====================================================
+
+        hls = cv2.cvtColor(
+            roi,
+            cv2.COLOR_BGR2HLS
+        )
+
+        hue = hls[:, :, 0]
+
+        # =====================================================
+        # SATURATION MASK
+        # =====================================================
+
+        _, saturation_mask = cv2.threshold(
             saturation,
             self.saturation_threshold,
             255,
             cv2.THRESH_BINARY
         )
 
-        # Remove tiny isolated noise
+        # =====================================================
+        # GRASS / GREEN MASK
+        #
+        # OpenCV HLS hue range:
+        # Green is approximately 35 - 90.
+        #
+        # Remove green pixels from the saturation mask.
+        # =====================================================
+
+        grass_mask = cv2.inRange(
+            hue,
+            35,
+            90
+        )
+
+        # =====================================================
+        # REMOVE GRASS
+        # =====================================================
+
+        mask = cv2.bitwise_and(
+            saturation_mask,
+            cv2.bitwise_not(grass_mask)
+        )
+
+        # =====================================================
+        # MORPHOLOGICAL CLEANUP
+        # =====================================================
+
         kernel = np.ones(
             (3, 3),
             np.uint8
         )
 
+        # Remove tiny isolated noise
         mask = cv2.morphologyEx(
             mask,
             cv2.MORPH_OPEN,
@@ -339,7 +418,7 @@ class LaneDetector(Node):
                     )
 
         # -----------------------------------------------------
-        # Select best candidates
+        # Select best lines
         # -----------------------------------------------------
 
         left_line = self.select_best_line(

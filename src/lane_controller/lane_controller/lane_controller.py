@@ -18,8 +18,8 @@ class LaneController(Node):
         self.kp = 0.02
         self.kd = 0.0005
 
-        self.forward_speed = 7.0
-        self.steering_limit = 0.8
+        self.forward_speed = 5.0
+        self.steering_limit = 0.7
 
         # -------------------------
         # Controller state
